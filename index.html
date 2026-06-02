@@ -1,0 +1,1296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex" />
+<title>Wellbeing Lab — Meeting Register</title>
+<style>html,body{margin:0;background:#FAF7EE}</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script type="text/babel" data-type="module" data-presets="react">
+
+import React, { useState, useEffect, useCallback } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  CalendarDays, Users, Clock, Check, X, Settings, Plus, Trash2,
+  Mail, AlertTriangle, ShieldCheck, ArrowLeft, RefreshCw, ChevronDown,
+  ChevronRight, Presentation, UserCheck, Lock,
+} from "https://esm.sh/lucide-react@0.383.0?deps=react@18.2.0";
+
+/* ============================================================= */
+/*  >>> EDIT THESE TWO LINES with your Supabase project values <<< */
+/*  (Supabase dashboard -> Project Settings -> API)              */
+const SUPABASE_URL      = "https://YOUR-PROJECT.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";
+/* ============================================================= */
+
+let supabase = null;
+try { supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY); } catch (e) { supabase = null; }
+
+/* Shared data lives in a Supabase "kv" table; per-device identity stays in this browser. */
+const sget = async (key, shared = true) => {
+  if (!shared) {
+    try { const v = localStorage.getItem("lm:" + key); return v ? JSON.parse(v) : null; } catch { return null; }
+  }
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase.from("kv").select("value").eq("key", key).maybeSingle();
+    if (error) throw error;
+    return data ? data.value : null;
+  } catch { return null; }
+};
+const sset = async (key, val, shared = true) => {
+  if (!shared) {
+    try { localStorage.setItem("lm:" + key, JSON.stringify(val)); return true; } catch { return false; }
+  }
+  if (!supabase) return false;
+  try {
+    const { error } = await supabase.from("kv").upsert({ key, value: val, updated_at: new Date().toISOString() });
+    if (error) throw error;
+    return true;
+  } catch { return false; }
+};
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+const fmtTime = (min) => {
+  let h = Math.floor(min / 60), m = min % 60;
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12; if (h === 0) h = 12;
+  return `${h}:${String(m).padStart(2, "0")} ${ap}`;
+};
+const fmtDate = (s) => {
+  const d = new Date(s + "T00:00:00");
+  return d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+};
+const daysUntil = (s) => {
+  const a = new Date(s + "T00:00:00"), b = new Date(todayStr() + "T00:00:00");
+  return Math.round((a - b) / 86400000);
+};
+const addDays = (s, n) => {
+  const d = new Date(s + "T00:00:00"); d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+/* Pull every email-looking token out of free text (excludes colons so "Name：email" splits right). */
+const extractEmails = (text) => (text || "").match(/[^\s,;:：<>"]+@[^\s,;:：<>"]+\.[A-Za-z]{2,}/g) || [];
+
+/* Parse pasted lines like "Name: email", "Name <email>", "Name：email", or bare "email"
+   into { id, name, email } entries. Finds the address first, then treats whatever precedes it as the name. */
+const parseRecipients = (text) =>
+  (text || "").split(/\n/).map((line) => {
+    const em = line.match(/[^\s,;:：<>"]+@[^\s,;:：<>"]+\.[A-Za-z]{2,}/);
+    if (!em) return null;
+    const name = line.slice(0, em.index).replace(/[<>：:"]/g, " ").trim();
+    return { id: uid(), name, email: em[0].trim() };
+  }).filter(Boolean);
+
+/* Build a pre-filled mailto: link announcing a meeting. All recipients go in To,
+   the professor in Cc. Recipients = roster member emails + the extra notify list. */
+const buildMeetingMailto = (meeting, config, roster) => {
+  const presenters = (meeting.presenters || []).map((id) => roster.find((r) => r.id === id)?.name || "—");
+  const prof = config.professorName || "the professor";
+  const subject = `${config.labName || "Lab"} meeting — ${fmtDate(meeting.date)}`;
+  const body = [
+    "Dear all,",
+    "",
+    "This is a reminder about our upcoming lab meeting:",
+    "",
+    `Date: ${fmtDate(meeting.date)}`,
+    `Time: ${fmtTime(config.startMin)}–${fmtTime(config.endMin)}`,
+    `Room: ${config.room || "—"}`,
+    `Presenting: ${presenters.length ? presenters.join(", ") : "TBC"}`,
+    "",
+    `If you are unable to participate, please inform ${prof} in advance.`,
+    "",
+    "Thank you,",
+  ].join("\n");
+  const rosterEmails = roster.map((r) => r.email).filter(Boolean);
+  const extra = [
+    ...extractEmails(config.notifyRaw),
+    ...((config.notifyList || []).map((n) => n.email).filter(Boolean)),
+  ];
+  const recipients = [...new Set([...rosterEmails, ...extra].map((e) => e.trim()).filter(Boolean))];
+  const to = recipients.length ? encodeURIComponent(recipients.join(",")) : "";
+  const cc = config.teacherEmail ? `&cc=${encodeURIComponent(config.teacherEmail)}` : "";
+  return {
+    href: `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}${cc}`,
+    missing: recipients.length === 0 && !config.teacherEmail,
+    count: recipients.length,
+    subject, body, recipients, ccAddr: config.teacherEmail || "",
+  };
+};
+
+const DEFAULT_CONFIG = {
+  labName: "Wellbeing Lab", teacherEmail: "", adminPin: "1234",
+  professorName: "Professor Chiang", room: "337", notifyList: [],
+  startMin: 14 * 60 + 30, endMin: 17 * 60,
+  presenterMinutes: 40, breakMinutes: 10, bufferMinutes: 10,
+};
+
+/* compute slots from an ordered presenter list. `breaks` optionally sets each gap
+   individually (breaks[i] = minutes after presenter i); missing entries use the default. */
+const computeSchedule = (cfg, presenterNames, breaks) => {
+  let t = cfg.startMin;
+  const slots = presenterNames.map((name, i) => {
+    const start = t, end = t + cfg.presenterMinutes;
+    t = end;
+    const isLast = i === presenterNames.length - 1;
+    const brk = isLast ? 0 : (breaks && breaks[i] != null ? breaks[i] : cfg.breakMinutes);
+    if (!isLast) t += brk;
+    return { name, start, end, breakAfter: brk };
+  });
+  const finish = t + cfg.bufferMinutes;
+  return { slots, finish, overrun: finish - cfg.endMin };
+};
+
+/* ================================================================== */
+function LabMeetingApp() {
+  const [loading, setLoading] = useState(true);
+  const [persistOk, setPersistOk] = useState(true);
+  const [config, setConfig] = useState(null);
+  const [roster, setRoster] = useState([]);
+  const [meetings, setMeetings] = useState([]);
+  const [me, setMe] = useState(null);          // studentId of this device
+  const [tab, setTab] = useState("home");
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  const load = useCallback(async () => {
+    const probe = await sset("__probe", { t: Date.now() });
+    setPersistOk(probe);
+    const [c, r, m, idn] = await Promise.all([
+      sget("lab-config"), sget("lab-roster"), sget("lab-meetings"), sget("my-identity", false),
+    ]);
+    setConfig(c); setRoster(r || []); setMeetings(m || []);
+    setMe(idn?.studentId || null);
+    setLoading(false);
+  }, []);
+  useEffect(() => { load(); const f = () => load(); window.addEventListener("focus", f); return () => window.removeEventListener("focus", f); }, [load]);
+
+  const persistConfig = async (c) => { setConfig(c); await sset("lab-config", c); };
+  const persistRoster = async (r) => { setRoster(r); await sset("lab-roster", r); };
+  const persistMeetings = async (m) => { setMeetings(m); await sset("lab-meetings", m); };
+  const chooseIdentity = async (id) => { setMe(id); await sset("my-identity", { studentId: id }, false); };
+
+  if (loading) return <Shell><div style={{ padding: 60, textAlign: "center", fontFamily: "var(--mono)" }}>loading…</div></Shell>;
+
+  /* ---- first-run setup ---- */
+  if (!config) return <Shell><Setup onDone={async (c, r) => { await persistConfig(c); await persistRoster(r); }} persistOk={persistOk} /></Shell>;
+
+  /* ---- who are you (also re-prompts if the saved identity no longer matches a member) ---- */
+  const meMember = me ? roster.find((x) => x.id === me) : null;
+  if (!meMember) return <Shell><Identity roster={roster} onPick={chooseIdentity} /></Shell>;
+  const sorted = [...meetings].sort((a, b) => a.date.localeCompare(b.date));
+  const upcoming = sorted.filter((m) => daysUntil(m.date) >= 0);
+  const past = sorted.filter((m) => daysUntil(m.date) < 0).reverse();
+  const nextMeeting = upcoming[0] || null;
+
+  return (
+    <Shell>
+      <Header
+        config={config} meName={meMember.name} meGroup={meMember.group}
+        onRefresh={load} onSwitch={() => chooseIdentity(null)} persistOk={persistOk}
+      />
+
+      <nav className="tabs">
+        {[["home", "Next meeting", CalendarDays], ["history", "History", Clock], ["admin", "Admin", ShieldCheck]].map(
+          ([k, label, Icon]) => (
+            <button key={k} className={"tab" + (tab === k ? " on" : "")} onClick={() => setTab(k)}>
+              <Icon size={15} /> {label}
+            </button>
+          )
+        )}
+      </nav>
+
+      <main style={{ padding: "0 18px 40px" }}>
+        {tab === "home" && (
+          <Home meeting={nextMeeting} config={config} roster={roster} me={me}
+            onRSVP={async (status, reason) => {
+              const m = meetings.find((x) => x.id === nextMeeting.id);
+              const fresh = await sget("lab-meetings") || meetings;     // reduce clobbering
+              const mm = fresh.find((x) => x.id === nextMeeting.id) || m;
+              mm.attendance = { ...(mm.attendance || {}), [me]: { status, reason, ts: Date.now() } };
+              await persistMeetings([...fresh]);
+            }} />
+        )}
+        {tab === "history" && <History past={past} roster={roster} config={config} isAdmin={isAdmin} />}
+        {tab === "admin" && (
+          <Admin
+            isAdmin={isAdmin} setIsAdmin={setIsAdmin} config={config} roster={roster}
+            meetings={meetings} upcoming={upcoming}
+            persistConfig={persistConfig} persistRoster={persistRoster} persistMeetings={persistMeetings}
+          />
+        )}
+      </main>
+      <Style />
+    </Shell>
+  );
+}
+
+/* ================================================================== */
+/*  Shell + global style                                              */
+/* ================================================================== */
+function Shell({ children }) {
+  return (
+    <div className="wrap">
+      <div className="paper">{children}</div>
+      <Style />
+    </div>
+  );
+}
+
+function Header({ config, meName, meGroup, onRefresh, onSwitch, persistOk }) {
+  return (
+    <header className="hd">
+      <div>
+        <div className="kicker">LAB MEETING REGISTER</div>
+        <h1>{config.labName || "Our Lab"}</h1>
+      </div>
+      <div className="hd-right">
+        <button className="ghost" onClick={onRefresh} title="Refresh shared data"><RefreshCw size={15} /></button>
+        <button className="who" onClick={onSwitch} title="Switch user">
+          <span className="who-name">{meName}</span>
+          <span className="badge">{meGroup}</span>
+        </button>
+      </div>
+      {!persistOk && <div className="warn-strip"><AlertTriangle size={13} /> Can't reach the database — open index.html and check your Supabase URL & key near the top.</div>}
+    </header>
+  );
+}
+
+/* ================================================================== */
+/*  HOME — next meeting + RSVP                                        */
+/* ================================================================== */
+function Home({ meeting, config, roster, me, onRSVP }) {
+  const [rsvpOpen, setRsvpOpen] = useState(false);
+
+  if (!meeting)
+    return <Empty icon={CalendarDays} title="No meeting scheduled"
+      sub="Head to the Admin tab to schedule the next lab meeting." />;
+
+  const presenterNames = (meeting.presenters || []).map((id) => roster.find((r) => r.id === id)?.name || "—");
+  const sched = computeSchedule(config, presenterNames, meeting.breaks);
+  const att = meeting.attendance || {};
+  const myStatus = att[me]?.status;
+  const dleft = daysUntil(meeting.date);
+
+  // every lab member is expected at every meeting and can RSVP, regardless of whose turn
+  // it is to present; the meeting's "group" only marks whose presenting week it is
+  const presenterSet = new Set(meeting.presenters || []);
+  const participants = [...roster].sort((a, b) => a.group.localeCompare(b.group) || a.name.localeCompare(b.name));
+  const yes = participants.filter((r) => att[r.id]?.status === "yes").length;
+  const no = participants.filter((r) => att[r.id]?.status === "no").length;
+  const pending = Math.max(0, participants.length - yes - no);
+
+  return (
+    <>
+      <div className="card lead">
+        <div className="lead-top">
+          <span className={"gtag g" + meeting.group}>GROUP {meeting.group}</span>
+          <span className="countdown">{dleft === 0 ? "TODAY" : dleft === 1 ? "TOMORROW" : `IN ${dleft} DAYS`}</span>
+        </div>
+        <div className="bigdate">{fmtDate(meeting.date)}</div>
+        <div className="timerange">{fmtTime(config.startMin)} – {fmtTime(config.endMin)}</div>
+
+        <div className="rsvp-row">
+          <span className="rsvp-label">Your attendance:</span>
+          {myStatus === "yes" && <span className="pill yes"><Check size={13} /> Attending</span>}
+          {myStatus === "no" && <span className="pill no"><X size={13} /> Not attending</span>}
+          {!myStatus && <span className="pill pend">Not logged yet</span>}
+          <button className="btn sm" onClick={() => setRsvpOpen(true)}>{myStatus ? "Change" : "Log attendance"}</button>
+        </div>
+        {myStatus === "no" && (
+          <div className="inform" style={{ marginTop: 12 }}>
+            <AlertTriangle size={15} />
+            <span>
+              You're marked as not attending — please let <b>{config.professorName || "the professor"}</b> know.
+              {config.teacherEmail && <> <a href={`mailto:${config.teacherEmail}?subject=${encodeURIComponent("Lab meeting — can't attend")}`} style={{ color: "var(--rust)", fontWeight: 600 }}>Email them</a>.</>}
+            </span>
+          </div>
+        )}
+      </div>
+
+      <SectionTitle n="01">Who is presenting</SectionTitle>
+      {sched.slots.length === 0 ? (
+        <div className="card soft"><AlertTriangle size={15} /> &nbsp;No presenters assigned yet. The admin needs to assign them — otherwise no one presents.</div>
+      ) : (
+        <div className="card">
+          {sched.slots.map((s, i) => (
+            <React.Fragment key={i}>
+              <div className="slot">
+                <Presentation size={16} className="slot-ic" />
+                <div className="slot-main">
+                  <div className="slot-name">{s.name}</div>
+                  <div className="slot-time">{fmtTime(s.start)} – {fmtTime(s.end)} · {config.presenterMinutes} min</div>
+                </div>
+                <div className="slot-no">{String(i + 1).padStart(2, "0")}</div>
+              </div>
+              {s.breakAfter > 0 && <div className="break">— {s.breakAfter} min break —</div>}
+            </React.Fragment>
+          ))}
+          <div className="buffer">+ {config.bufferMinutes} min buffer · ends ~{fmtTime(sched.finish)}</div>
+          {sched.overrun > 0 && (
+            <div className="warn-inline"><AlertTriangle size={13} /> Runs {sched.overrun} min past {fmtTime(config.endMin)}. Trim slot length or breaks in Admin → Settings.</div>
+          )}
+        </div>
+      )}
+
+      <SectionTitle n="02">Attendance · all members</SectionTitle>
+      <div className="card">
+        <div className="att-summary">
+          <div className="att-stat"><b style={{ color: "var(--teal)" }}>{yes}</b><span>attending</span></div>
+          <div className="att-stat"><b style={{ color: "var(--rust)" }}>{no}</b><span>out</span></div>
+          <div className="att-stat"><b style={{ color: "var(--ink-soft)" }}>{pending}</b><span>no reply</span></div>
+        </div>
+        <div className="att-list">
+          {participants.map((r) => {
+            const a = att[r.id];
+            const presenting = presenterSet.has(r.id);
+            return (
+              <div className="att-row" key={r.id}>
+                <span>
+                  <span className={"grp-dot g" + r.group}>{r.group}</span>
+                  {r.name}
+                  {presenting && <Presentation size={12} className="present-mark" />}
+                </span>
+                {a?.status === "yes" && <span className="dot yes"><Check size={12} /></span>}
+                {a?.status === "no" && <span className="dot no"><X size={12} /></span>}
+                {!a && <span className="dot pend">·</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {rsvpOpen && (
+        <RSVPModal config={config} current={att[me]} onClose={() => setRsvpOpen(false)}
+          onSave={async (st, rs) => { await onRSVP(st, rs); setRsvpOpen(false); }} />
+      )}
+    </>
+  );
+}
+
+function EmailModal({ mail, onClose }) {
+  const [copied, setCopied] = useState("");
+  const toLine = mail.recipients.join(", ");
+  const full = `To: ${toLine}\nCc: ${mail.ccAddr}\nSubject: ${mail.subject}\n\n${mail.body}`;
+  const copy = async (text, which) => {
+    try { await navigator.clipboard.writeText(text); setCopied(which); setTimeout(() => setCopied(""), 1500); }
+    catch { setCopied("manual"); }
+  };
+  return (
+    <Modal title="Meeting email" onClose={onClose}>
+      <label className="lbl">Recipients (To) · {mail.recipients.length}</label>
+      <textarea className="ta" readOnly rows={2} value={toLine} onFocus={(e) => e.target.select()} style={{ fontFamily: "var(--mono)", fontSize: 11 }} />
+      <div className="muted sm" style={{ marginTop: 4 }}>Cc: {mail.ccAddr || "— (set the professor's email in Settings)"}</div>
+      <label className="lbl" style={{ marginTop: 12 }}>Message</label>
+      <textarea className="ta" readOnly rows={9} value={mail.body} onFocus={(e) => e.target.select()} />
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <button className="btn outline" style={{ flex: 1 }} onClick={() => copy(full, "all")}>{copied === "all" ? "Copied ✓" : "Copy all"}</button>
+        <a className="btn" style={{ flex: 1, textDecoration: "none", textAlign: "center" }} href={mail.href}>Open in email</a>
+      </div>
+      <div className="muted sm" style={{ marginTop: 8 }}>
+        {copied === "manual"
+          ? "Couldn't auto-copy — tap a box, select all, and copy by hand."
+          : "No mail app? Use Copy all, then paste into Gmail (the To/Cc/Subject lines are included)."}
+      </div>
+    </Modal>
+  );
+}
+
+function RSVPModal({ config, current, onClose, onSave }) {
+  const [status, setStatus] = useState(current?.status || "yes");
+  const [reason, setReason] = useState(current?.reason || "");
+  const prof = config.professorName || "the professor";
+  const mailto = config.teacherEmail
+    ? `mailto:${config.teacherEmail}?subject=${encodeURIComponent("Lab meeting — can't attend")}&body=${encodeURIComponent(reason || "")}`
+    : null;
+
+  return (
+    <Modal onClose={onClose} title="Log your attendance">
+      <div className="seg">
+        <button className={"seg-b" + (status === "yes" ? " on yes" : "")} onClick={() => setStatus("yes")}>
+          <Check size={15} /> I'll attend
+        </button>
+        <button className={"seg-b" + (status === "no" ? " on no" : "")} onClick={() => setStatus("no")}>
+          <X size={15} /> Can't make it
+        </button>
+      </div>
+      {status === "no" && (
+        <div style={{ marginTop: 14 }}>
+          <div className="inform">
+            <AlertTriangle size={15} />
+            <span>Please also let <b>{prof}</b> know you won't be attending.</span>
+          </div>
+          <label className="lbl" style={{ marginTop: 12 }}>Reason (the admin will see this)</label>
+          <textarea className="ta" rows={3} value={reason} onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. away at a conference, sick, clashing seminar…" />
+          {mailto && (
+            <a className="btn outline full" href={mailto} style={{ marginTop: 10, textDecoration: "none" }}>
+              <Mail size={15} /> Email {prof} now
+            </a>
+          )}
+        </div>
+      )}
+      <button className="btn full" style={{ marginTop: 16 }}
+        onClick={() => onSave(status, status === "no" ? reason : "")}>
+        Save
+      </button>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
+/*  HISTORY                                                           */
+/* ================================================================== */
+function History({ past, roster, config, isAdmin }) {
+  const [open, setOpen] = useState(null);
+  if (past.length === 0) return <Empty icon={Clock} title="No past meetings yet" sub="Once a meeting date passes, it shows up here." />;
+  const nameOf = (id) => roster.find((r) => r.id === id)?.name || "—";
+
+  return (
+    <>
+      <SectionTitle n="00">Past meetings</SectionTitle>
+      {past.map((m) => {
+        const att = m.attendance || {};
+        const present = Object.entries(att).filter(([, a]) => a.status === "yes").map(([id]) => nameOf(id));
+        const absent = Object.entries(att).filter(([, a]) => a.status === "no");
+        const presenters = (m.presenters || []).map(nameOf);
+        const isOpen = open === m.id;
+        return (
+          <div className="card hist" key={m.id}>
+            <button className="hist-head" onClick={() => setOpen(isOpen ? null : m.id)}>
+              <div>
+                <div className="hist-date">{fmtDate(m.date)} <span className={"gtag g" + m.group} style={{ marginLeft: 6 }}>{m.group}</span></div>
+                <div className="hist-sub">{presenters.length ? presenters.join(", ") : "no presenters"} · {present.length} attended</div>
+              </div>
+              {isOpen ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+            </button>
+            {isOpen && (
+              <div className="hist-body">
+                <div className="mini-lbl">Presented</div>
+                <div className="chips">{presenters.length ? presenters.map((n, i) => <span className="chip teal" key={i}><Presentation size={11} /> {n}</span>) : <span className="muted">— none —</span>}</div>
+                <div className="mini-lbl">Attended ({present.length})</div>
+                <div className="chips">{present.length ? present.map((n, i) => <span className="chip" key={i}>{n}</span>) : <span className="muted">—</span>}</div>
+                <div className="mini-lbl">Absent ({absent.length})</div>
+                <div className="chips">{absent.length ? absent.map(([id, a], i) => (
+                  <span className="chip out" key={i}>{nameOf(id)}{isAdmin && a.reason ? ` — ${a.reason}` : ""}</span>
+                )) : <span className="muted">—</span>}</div>
+                {!isAdmin && absent.some(([, a]) => a.reason) && <div className="muted sm">Absence reasons are visible to the admin.</div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/* ================================================================== */
+/*  ADMIN                                                             */
+/* ================================================================== */
+function Admin({ isAdmin, setIsAdmin, config, roster, meetings, upcoming, persistConfig, persistRoster, persistMeetings }) {
+  const [pin, setPin] = useState("");
+  const [pinErr, setPinErr] = useState(false);
+  const [panel, setPanel] = useState("schedule");
+  const tryUnlock = () => { if (pin === config.adminPin) setIsAdmin(true); else setPinErr(true); };
+
+  if (!isAdmin)
+    return (
+      <div className="card lock">
+        <Lock size={22} />
+        <h3>Admin access</h3>
+        <p className="muted">Enter the admin PIN to assign presenters, manage the roster and read absence reasons.</p>
+        <input className="inp" type="password" inputMode="numeric" placeholder="PIN" value={pin}
+          onChange={(e) => { setPin(e.target.value); setPinErr(false); }} onKeyDown={(e) => e.key === "Enter" && tryUnlock()} />
+        {pinErr && <div className="warn-inline" style={{ justifyContent: "center" }}><AlertTriangle size={13} /> Wrong PIN</div>}
+        <button className="btn full" onClick={tryUnlock}>Unlock</button>
+      </div>
+    );
+
+  return (
+    <>
+      <div className="subtabs">
+        {[["schedule", "Schedule"], ["roster", "Roster"], ["emails", "Emails"], ["reasons", "RSVPs"], ["settings", "Settings"], ["backup", "Backup"]].map(([k, l]) => (
+          <button key={k} className={"subtab" + (panel === k ? " on" : "")} onClick={() => setPanel(k)}>{l}</button>
+        ))}
+      </div>
+      {panel === "schedule" && <ScheduleAdmin config={config} roster={roster} meetings={meetings} persistMeetings={persistMeetings} />}
+      {panel === "roster" && <RosterAdmin roster={roster} persistRoster={persistRoster} />}
+      {panel === "emails" && <EmailsAdmin config={config} roster={roster} persistConfig={persistConfig} persistRoster={persistRoster} />}
+      {panel === "reasons" && <ReasonsAdmin upcoming={upcoming} roster={roster} />}
+      {panel === "settings" && <SettingsAdmin config={config} persistConfig={persistConfig} />}
+      {panel === "backup" && <BackupAdmin config={config} roster={roster} meetings={meetings} persistConfig={persistConfig} persistRoster={persistRoster} persistMeetings={persistMeetings} />}
+    </>
+  );
+}
+
+function ScheduleAdmin({ config, roster, meetings, persistMeetings }) {
+  const last = [...meetings].sort((a, b) => b.date.localeCompare(a.date))[0];
+  const blank = {
+    id: null,
+    date: last ? addDays(last.date, 14) : addDays(todayStr(), 7),
+    group: last ? (last.group === "A" ? "B" : "A") : "A",
+    presenters: [],
+    breaks: [],
+  };
+  const [draft, setDraft] = useState(blank);
+  const [showAll, setShowAll] = useState(false);
+  const [justSaved, setJustSaved] = useState(null);
+  const [mailNote, setMailNote] = useState("");
+  const [reminderFor, setReminderFor] = useState(null);
+  const reset = () => { setShowAll(false); setDraft({ ...blank, date: last ? addDays(last.date, 14) : addDays(todayStr(), 7) }); };
+
+  // members of the meeting's group first; if "show all" is on, append everyone else so a
+  // guest from the other group can present (e.g. a swap when someone can't make their week)
+  const inGroup = roster.filter((r) => r.group === draft.group);
+  const others = roster.filter((r) => r.group !== draft.group);
+  const pickList = showAll ? [...inGroup, ...others] : inGroup;
+  const togglePresenter = (id) =>
+    setDraft((d) => ({ ...d, presenters: d.presenters.includes(id) ? d.presenters.filter((x) => x !== id) : [...d.presenters, id] }));
+
+  const names = draft.presenters.map((id) => roster.find((r) => r.id === id)?.name || "—");
+  const sched = computeSchedule(config, names, draft.breaks);
+
+  const setBreak = (i, val) =>
+    setDraft((d) => {
+      const b = [...d.breaks];
+      for (let k = b.length; k <= i; k++) b[k] = config.breakMinutes;
+      b[i] = val;
+      return { ...d, breaks: b };
+    });
+
+  const save = async () => {
+    const need = Math.max(0, draft.presenters.length - 1);
+    const breaks = Array.from({ length: need }, (_, i) => (draft.breaks[i] != null ? draft.breaks[i] : config.breakMinutes));
+    const payload = { ...draft, breaks };
+    if (draft.id) {
+      await persistMeetings(meetings.map((m) => m.id === draft.id ? payload : m));
+      setJustSaved(null);
+    } else {
+      const created = { ...payload, id: uid(), attendance: {} };
+      await persistMeetings([...meetings, created]);
+      setJustSaved(created);
+    }
+    reset();
+  };
+  const edit = (m) => setDraft({ id: m.id, date: m.date, group: m.group, presenters: m.presenters || [], breaks: m.breaks || [], attendance: m.attendance });
+  const del = async (id) => persistMeetings(meetings.filter((m) => m.id !== id));
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  const sorted = [...meetings].sort((a, b) => b.date.localeCompare(a.date));
+
+  return (
+    <>
+      <SectionTitle n="A1">{draft.id ? "Edit meeting" : "Schedule a meeting"}</SectionTitle>
+      <div className="card form">
+        <div className="grid2">
+          <div>
+            <label className="lbl">Date</label>
+            <input className="inp" type="date" value={draft.date} onChange={(e) => setDraft({ ...draft, date: e.target.value })} />
+          </div>
+          <div>
+            <label className="lbl">Group</label>
+            <div className="seg sm">
+              {["A", "B"].map((g) => (
+                <button key={g} className={"seg-b" + (draft.group === g ? " on" : "")}
+                  onClick={() => setDraft({ ...draft, group: g, presenters: [] })}>Group {g}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <label className="lbl" style={{ marginTop: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>Assign presenters <span className="muted">(tap in presenting order)</span></span>
+          <button type="button" className="ghost sm" onClick={() => setShowAll((v) => !v)}>
+            {showAll ? "Group " + draft.group + " only" : "Show all members"}
+          </button>
+        </label>
+        {pickList.length === 0 ? <div className="muted sm">No members in Group {draft.group} yet — add them in the Roster tab, or tap "Show all members".</div> : (
+          <div className="picker">
+            {pickList.map((r) => {
+              const idx = draft.presenters.indexOf(r.id);
+              const guest = r.group !== draft.group;
+              return (
+                <button key={r.id} className={"pick" + (idx >= 0 ? " on" : "")} onClick={() => togglePresenter(r.id)}>
+                  {idx >= 0 && <span className="pick-no">{idx + 1}</span>}{r.name}
+                  {guest && <span className="guest-tag">{r.group}</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {names.length > 0 && (
+          <div className="preview">
+            {sched.slots.map((s, i) => (
+              <React.Fragment key={i}>
+                <div className="pv-row"><span>{s.name}</span><span className="mono">{fmtTime(s.start)}–{fmtTime(s.end)}</span></div>
+                {i < sched.slots.length - 1 && (
+                  <div className="pv-break">
+                    <span>break after</span>
+                    <span className="pv-break-edit">
+                      <input className="inp mono brk" type="number" min="0"
+                        value={draft.breaks[i] != null ? draft.breaks[i] : config.breakMinutes}
+                        onChange={(e) => setBreak(i, Math.max(0, parseInt(e.target.value || 0, 10)))} />
+                      min
+                    </span>
+                  </div>
+                )}
+              </React.Fragment>
+            ))}
+            <div className="pv-row finish"><span>ends ~</span><span className="mono">{fmtTime(sched.finish)}</span></div>
+            {sched.overrun > 0 && <div className="warn-inline"><AlertTriangle size={13} /> {sched.overrun} min past {fmtTime(config.endMin)}</div>}
+          </div>
+        )}
+
+        <div className="row-end">
+          {draft.id && <button className="btn outline" onClick={reset}>Cancel</button>}
+          <button className="btn" onClick={save}>{draft.id ? "Update meeting" : "Add meeting"}</button>
+        </div>
+      </div>
+
+      {justSaved && (() => {
+        const mail = buildMeetingMailto(justSaved, config, roster);
+        return (
+          <div className="card notify">
+            <div>
+              <div className="notify-t">Meeting saved — notify everyone?</div>
+              <div className="muted sm">{fmtDate(justSaved.date)} · opens a ready-to-send email (or copy it).</div>
+            </div>
+            <button className="btn sm"
+               onClick={() => mail.missing ? setMailNote("No recipient emails yet — add them in the Emails tab.") : setReminderFor(justSaved.id)}>
+              <Mail size={14} /> Email everyone
+            </button>
+          </div>
+        );
+      })()}
+
+      {mailNote && <div className="card soft" style={{ color: "var(--rust)" }}><AlertTriangle size={14} /> &nbsp;{mailNote}</div>}
+
+      <SectionTitle n="A2">All meetings</SectionTitle>
+      {sorted.length === 0 && <div className="muted sm" style={{ padding: 8 }}>None yet.</div>}
+      {sorted.map((m) => {
+        const mail = buildMeetingMailto(m, config, roster);
+        return (
+        <div className="card line-row" key={m.id}>
+          <div>
+            <div className="lr-date">{fmtDate(m.date)} <span className={"gtag g" + m.group}>{m.group}</span></div>
+            <div className="muted sm">{(m.presenters || []).length} presenter(s)</div>
+          </div>
+          <div className="lr-actions">
+            <button className="ghost" title="Email reminder for this meeting"
+               onClick={() => mail.missing ? setMailNote("No recipient emails yet — add them in the Emails tab.") : setReminderFor(m.id)}>
+              <Mail size={15} />
+            </button>
+            <button className="ghost" onClick={() => edit(m)}><Settings size={15} /></button>
+            {confirmDel === m.id
+              ? <button className="ghost danger sm" onClick={() => { del(m.id); setConfirmDel(null); }}>Delete?</button>
+              : <button className="ghost danger" onClick={() => setConfirmDel(m.id)}><Trash2 size={15} /></button>}
+          </div>
+        </div>
+        );
+      })}
+
+      {reminderFor && <EmailModal mail={buildMeetingMailto(meetings.find((m) => m.id === reminderFor), config, roster)} onClose={() => setReminderFor(null)} />}
+    </>
+  );
+}
+
+function RosterAdmin({ roster, persistRoster }) {
+  const [name, setName] = useState(""); const [group, setGroup] = useState("A"); const [email, setEmail] = useState("");
+  const [editing, setEditing] = useState(null); const [editVal, setEditVal] = useState("");
+  const [editName, setEditName] = useState(null); const [nameVal, setNameVal] = useState("");
+  const [confirmDel, setConfirmDel] = useState(null);
+  const add = async () => { if (!name.trim()) return; await persistRoster([...roster, { id: uid(), name: name.trim(), group, email: email.trim() }]); setName(""); setEmail(""); };
+  const remove = async (id) => persistRoster(roster.filter((r) => r.id !== id));
+  const move = async (id, g) => persistRoster(roster.map((r) => r.id === id ? { ...r, group: g } : r));
+  const startEdit = (r) => { setEditing(r.id); setEditVal(r.email || ""); };
+  const commitEdit = (id) => { persistRoster(roster.map((x) => x.id === id ? { ...x, email: editVal.trim() } : x)); setEditing(null); };
+  const startName = (r) => { setEditName(r.id); setNameVal(r.name); };
+  const commitName = (id) => { if (nameVal.trim()) persistRoster(roster.map((x) => x.id === id ? { ...x, name: nameVal.trim() } : x)); setEditName(null); };
+
+  return (
+    <>
+      <SectionTitle n="A1">Add member</SectionTitle>
+      <div className="card form">
+        <div className="grid2">
+          <div><label className="lbl">Name</label><input className="inp" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} /></div>
+          <div><label className="lbl">Group</label>
+            <div className="seg sm">{["A", "B"].map((g) => <button key={g} className={"seg-b" + (group === g ? " on" : "")} onClick={() => setGroup(g)}>{g}</button>)}</div>
+          </div>
+        </div>
+        <label className="lbl" style={{ marginTop: 12 }}>Email <span className="muted">(for meeting notices)</span></label>
+        <input className="inp" type="email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="optional, but needed to email this person" />
+        <button className="btn full" style={{ marginTop: 12 }} onClick={add}><Plus size={15} /> Add</button>
+      </div>
+      {["A", "B"].map((g) => (
+        <div key={g}>
+          <SectionTitle n={"G" + g}>Group {g}</SectionTitle>
+          <div className="card">
+            {roster.filter((r) => r.group === g).length === 0 && <div className="muted sm">No members.</div>}
+            {roster.filter((r) => r.group === g).map((r) => (
+              <div className="att-row" key={r.id}>
+                <span style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
+                  {editName === r.id ? (
+                    <input className="inp" style={{ flex: "0 1 130px", padding: "4px 6px", fontSize: 14 }}
+                      autoFocus value={nameVal} onChange={(e) => setNameVal(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") commitName(r.id); if (e.key === "Escape") setEditName(null); }}
+                      onBlur={() => commitName(r.id)} />
+                  ) : (
+                    <button className="name-edit" onClick={() => startName(r)} title="Tap to rename">{r.name}</button>
+                  )}
+                  {editing === r.id ? (
+                    <input className="inp mono" style={{ marginLeft: 8, flex: 1, padding: "4px 6px", fontSize: 12 }}
+                      autoFocus type="email" value={editVal} onChange={(e) => setEditVal(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") commitEdit(r.id); if (e.key === "Escape") setEditing(null); }}
+                      onBlur={() => commitEdit(r.id)} placeholder="name@example.com" />
+                  ) : (
+                    <button className={"email-chip" + (r.email ? "" : " missing")} onClick={() => startEdit(r)}>
+                      <Mail size={11} /> {r.email ? r.email : "add email"}
+                    </button>
+                  )}
+                </span>
+                <div className="lr-actions">
+                  <button className="ghost sm" onClick={() => move(r.id, g === "A" ? "B" : "A")}>→ {g === "A" ? "B" : "A"}</button>
+                  {confirmDel === r.id
+                    ? <button className="ghost danger sm" onClick={() => { remove(r.id); setConfirmDel(null); }}>Remove?</button>
+                    : <button className="ghost danger" onClick={() => setConfirmDel(r.id)}><Trash2 size={14} /></button>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function EmailsAdmin({ config, roster, persistConfig, persistRoster }) {
+  const list = config.notifyList || [];
+  const [name, setName] = useState(""); const [email, setEmail] = useState("");
+  const [bulk, setBulk] = useState(""); const [showBulk, setShowBulk] = useState(false);
+  const [editing, setEditing] = useState(null);   // "member:id" | "opt:id"
+  const [editVal, setEditVal] = useState("");
+  const [status, setStatus] = useState("");
+
+  const saveList = (next) => persistConfig({ ...config, notifyList: next });
+  const addOne = () => {
+    if (!email.trim()) return;
+    saveList([...list, { id: uid(), name: name.trim(), email: email.trim() }]);
+    setName(""); setEmail("");
+  };
+  const removeOne = (id) => saveList(list.filter((x) => x.id !== id));
+
+  const startEdit = (key, cur) => { setEditing(key); setEditVal(cur || ""); };
+  const commitEdit = (p) => {
+    const v = editVal.trim();
+    if (p.kind === "member") persistRoster(roster.map((x) => x.id === p.id ? { ...x, email: v } : x));
+    else saveList(list.map((e) => e.id === p.id ? { ...e, email: v } : e));
+    setEditing(null);
+  };
+
+  // route a parsed entry: if its name matches a roster member, put the email on that member;
+  // otherwise keep it in the notify list.
+  const importBulk = () => {
+    const parsed = parseRecipients(bulk);
+    if (!parsed.length) { setStatus("No email addresses found in that text."); return; }
+    const updated = roster.map((r) => ({ ...r }));
+    const have = new Set(list.map((x) => x.email.toLowerCase()));
+    const toNotify = [];
+    let onMembers = 0;
+    parsed.forEach((p) => {
+      const nm = p.name.trim().toLowerCase();
+      const member = nm ? updated.find((r) => r.name.trim().toLowerCase() === nm) : null;
+      if (member) { if (!member.email) member.email = p.email; onMembers++; }
+      else if (!have.has(p.email.toLowerCase())) { toNotify.push(p); have.add(p.email.toLowerCase()); }
+    });
+    if (onMembers) persistRoster(updated);
+    if (toNotify.length) saveList([...list, ...toNotify]);
+    setBulk(""); setShowBulk(false);
+    setStatus(`Imported: ${onMembers} attached to members, ${toNotify.length} added to the list.`);
+  };
+
+  // pull addresses already in the notify list onto matching roster members (by name)
+  const reconcile = () => {
+    const updated = roster.map((r) => ({ ...r }));
+    const remaining = [];
+    let moved = 0;
+    list.forEach((entry) => {
+      const nm = (entry.name || "").trim().toLowerCase();
+      const member = nm ? updated.find((r) => r.name.trim().toLowerCase() === nm) : null;
+      if (member) { if (!member.email) member.email = entry.email; moved++; }
+      else remaining.push(entry);
+    });
+    if (!moved) { setStatus("No names matched a roster member."); return; }
+    persistRoster(updated);
+    saveList(remaining);
+    setStatus(`Moved ${moved} address(es) onto matching members.`);
+  };
+
+  const total = new Set([...roster.map((r) => r.email).filter(Boolean), ...list.map((x) => x.email)].map((e) => e.toLowerCase())).size;
+  const everyone = [
+    ...roster.map((r) => ({ kind: "member", id: r.id, name: r.name, group: r.group, email: r.email || "" })),
+    ...list.map((x) => ({ kind: "optional", id: x.id, name: x.name, email: x.email })),
+  ].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "member" ? -1 : 1;
+    if (a.kind === "member" && a.group !== b.group) return a.group.localeCompare(b.group);
+    return (a.name || "").localeCompare(b.name || "");
+  });
+  const missingCount = everyone.filter((p) => !p.email).length;
+
+  return (
+    <>
+      <div className="card soft" style={{ color: "var(--ink-soft)", display: "block" }}>
+        Meeting emails go to <b>{total}</b> unique address(es) — everyone listed below, with {config.professorName || "the professor"} Cc'd on every one.
+      </div>
+
+      <SectionTitle n="E1">Add a recipient (not on roster)</SectionTitle>
+      <div className="card form">
+        <div className="grid2">
+          <div><label className="lbl">Name</label><input className="inp" value={name} onChange={(e) => setName(e.target.value)} placeholder="optional" /></div>
+          <div><label className="lbl">Email</label><input className="inp" type="email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addOne()} /></div>
+        </div>
+        <div className="row-end">
+          <button className="btn outline" onClick={() => setShowBulk((v) => !v)}>{showBulk ? "Cancel paste" : "Paste many"}</button>
+          <button className="btn" onClick={addOne}><Plus size={15} /> Add</button>
+        </div>
+        {showBulk && (
+          <div style={{ marginTop: 12 }}>
+            <label className="lbl">Paste a list <span className="muted">(one per line: "Name: email")</span></label>
+            <textarea className="ta" rows={6} value={bulk} onChange={(e) => setBulk(e.target.value)}
+              placeholder={"翊涵：r12142001@g.ntu.edu.tw\nIvo: d09142992@ntu.edu.tw"} />
+            <button className="btn full" style={{ marginTop: 10 }} onClick={importBulk}>
+              Import {parseRecipients(bulk).length || ""} address(es)
+            </button>
+          </div>
+        )}
+      </div>
+
+      {list.some((x) => x.name && roster.some((r) => r.name.trim().toLowerCase() === x.name.trim().toLowerCase())) && (
+        <div className="card notify" style={{ boxShadow: "4px 4px 0 var(--amber)", borderColor: "var(--amber)" }}>
+          <div>
+            <div className="notify-t">Some recipients are roster members</div>
+            <div className="muted sm">Attach their address to their roster record (clears the duplicate).</div>
+          </div>
+          <button className="btn sm" onClick={reconcile}><UserCheck size={14} /> Attach to members</button>
+        </div>
+      )}
+
+      {status && <div className="card soft" style={{ color: "var(--teal)", fontSize: 12.5 }}>{status}</div>}
+
+      <SectionTitle n="E2">All recipients ({everyone.length}){missingCount > 0 ? ` · ${missingCount} missing email` : ""}</SectionTitle>
+      <div className="card">
+        {everyone.length === 0 ? <div className="muted sm">No one yet.</div> :
+          everyone.map((p) => {
+            const key = p.kind + ":" + p.id;
+            const isEditing = editing === key;
+            return (
+              <div className="att-row" key={key}>
+                <span style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
+                  {p.kind === "member"
+                    ? <span className={"grp-dot g" + p.group}>{p.group}</span>
+                    : <span className="opt-dot">opt</span>}
+                  <b style={{ fontFamily: "var(--disp)" }}>{p.name || "—"}</b>
+                  {isEditing ? (
+                    <input className="inp mono" style={{ marginLeft: 8, flex: 1, padding: "4px 6px", fontSize: 12 }}
+                      autoFocus type="email" value={editVal}
+                      onChange={(e) => setEditVal(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") commitEdit(p); if (e.key === "Escape") setEditing(null); }}
+                      onBlur={() => commitEdit(p)} placeholder="name@example.com" />
+                  ) : (
+                    <button className={"email-chip" + (p.email ? "" : " missing")} onClick={() => startEdit(key, p.email)}>
+                      <Mail size={11} /> {p.email || "add email"}
+                    </button>
+                  )}
+                </span>
+                {p.kind === "optional" && !isEditing && <button className="ghost danger" onClick={() => removeOne(p.id)}><Trash2 size={14} /></button>}
+              </div>
+            );
+          })}
+      </div>
+    </>
+  );
+}
+
+function ReasonsAdmin({ upcoming, roster, config }) {
+  const nameOf = (id) => roster.find((r) => r.id === id)?.name || "—";
+  if (upcoming.length === 0) return <Empty icon={UserCheck} title="No upcoming meetings" sub="" />;
+  return (
+    <>
+      {upcoming.map((m) => {
+        const att = m.attendance || {};
+        const out = Object.entries(att).filter(([, a]) => a.status === "no");
+        const noReply = roster.filter((r) => !att[r.id]);
+        return (
+          <div key={m.id}>
+            <SectionTitle n="R">{fmtDate(m.date)} · Group {m.group}</SectionTitle>
+            <div className="card">
+              <div className="mini-lbl">Can't attend ({out.length})</div>
+              {out.length === 0 ? <div className="muted sm">Nobody has declined.</div> :
+                out.map(([id, a]) => (
+                  <div className="reason" key={id}>
+                    <b>{nameOf(id)}</b>
+                    <span>{a.reason || <i className="muted">no reason given</i>}</span>
+                  </div>
+                ))}
+              <div className="mini-lbl" style={{ marginTop: 12 }}>No response yet ({noReply.length})</div>
+              <div className="chips">{noReply.length ? noReply.map((r) => <span className="chip" key={r.id}>{r.name}</span>) : <span className="muted">—</span>}</div>
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function BackupAdmin({ config, roster, meetings, persistConfig, persistRoster, persistMeetings }) {
+  const snapshot = JSON.stringify({ v: 1, exportedAt: new Date().toISOString(), config, roster, meetings }, null, 2);
+  const [paste, setPaste] = useState("");
+  const [status, setStatus] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(snapshot); setCopied(true); setTimeout(() => setCopied(false), 2000); }
+    catch { setStatus("Couldn't auto-copy — tap inside the box, select all, and copy by hand."); }
+  };
+
+  const doRestore = () => {
+    let data;
+    try { data = JSON.parse(paste); }
+    catch { setStatus("That doesn't look like valid backup text."); setConfirmRestore(false); return; }
+    if (!data || !data.config || !Array.isArray(data.roster) || !Array.isArray(data.meetings)) {
+      setStatus("Backup is missing data — paste the whole thing."); setConfirmRestore(false); return;
+    }
+    persistConfig(data.config);
+    persistRoster(data.roster);
+    persistMeetings(data.meetings);
+    setStatus(`Restored ${data.roster.length} members, ${data.meetings.length} meeting(s), ${(data.config.notifyList || []).length} extra recipient(s).`);
+    setPaste(""); setConfirmRestore(false);
+  };
+
+  return (
+    <>
+      <div className="card soft" style={{ display: "block", color: "var(--ink-soft)" }}>
+        Copy this backup somewhere safe (email it to yourself, or keep it in a note). If you ever republish the app to a new link, paste it under <b>Restore</b> to bring everything back in one step — no re-typing.
+      </div>
+
+      <SectionTitle n="B1">Backup</SectionTitle>
+      <div className="card form">
+        <textarea className="ta" readOnly rows={7} value={snapshot} onFocus={(e) => e.target.select()}
+          style={{ fontFamily: "var(--mono)", fontSize: 11 }} />
+        <button className="btn full" style={{ marginTop: 10 }} onClick={copy}>{copied ? "Copied ✓" : "Copy backup"}</button>
+      </div>
+
+      <SectionTitle n="B2">Restore</SectionTitle>
+      <div className="card form">
+        <label className="lbl">Paste a backup here — this replaces all current data</label>
+        <textarea className="ta" rows={6} value={paste} onChange={(e) => { setPaste(e.target.value); setConfirmRestore(false); }}
+          placeholder="paste backup text…" style={{ fontFamily: "var(--mono)", fontSize: 11 }} />
+        {confirmRestore
+          ? <button className="btn full" style={{ marginTop: 10, background: "var(--rust)" }} onClick={doRestore}>Confirm — replace everything</button>
+          : <button className="btn full outline" style={{ marginTop: 10 }} onClick={() => paste.trim() && setConfirmRestore(true)}>Restore from backup</button>}
+      </div>
+
+      {status && <div className="card soft" style={{ color: "var(--teal)", fontSize: 12.5 }}>{status}</div>}
+    </>
+  );
+}
+
+function SettingsAdmin({ config, persistConfig }) {
+  const [c, setC] = useState(config);
+  const [sH, setSH] = useState(Math.floor(config.startMin / 60)), [sM, setSM] = useState(config.startMin % 60);
+  const [eH, setEH] = useState(Math.floor(config.endMin / 60)), [eM, setEM] = useState(config.endMin % 60);
+  const [saved, setSaved] = useState(false);
+  const save = async () => {
+    await persistConfig({ ...c, startMin: sH * 60 + sM, endMin: eH * 60 + eM });
+    setSaved(true); setTimeout(() => setSaved(false), 2000);
+  };
+  const num = (v) => Math.max(0, parseInt(v || 0, 10));
+  return (
+    <>
+      <SectionTitle n="S1">Lab</SectionTitle>
+      <div className="card form">
+        <label className="lbl">Lab name</label>
+        <input className="inp" value={c.labName} onChange={(e) => setC({ ...c, labName: e.target.value })} />
+        <div className="grid2" style={{ marginTop: 12 }}>
+          <div><label className="lbl">Professor's name</label><input className="inp" value={c.professorName || ""} onChange={(e) => setC({ ...c, professorName: e.target.value })} /></div>
+          <div><label className="lbl">Room</label><input className="inp" value={c.room || ""} onChange={(e) => setC({ ...c, room: e.target.value })} /></div>
+        </div>
+        <label className="lbl" style={{ marginTop: 12 }}>Professor's email <span className="muted">(absence notices & meeting emails)</span></label>
+        <input className="inp" type="email" value={c.teacherEmail} onChange={(e) => setC({ ...c, teacherEmail: e.target.value })} />
+        <label className="lbl" style={{ marginTop: 12 }}>Admin PIN</label>
+        <input className="inp" value={c.adminPin} onChange={(e) => setC({ ...c, adminPin: e.target.value })} />
+      </div>
+
+      <SectionTitle n="S2">Time plan</SectionTitle>
+      <div className="card form">
+        <div className="grid2">
+          <div><label className="lbl">Start</label><div className="timefield"><input className="inp mono" type="number" value={sH} onChange={(e) => setSH(num(e.target.value))} />:<input className="inp mono" type="number" value={sM} onChange={(e) => setSM(num(e.target.value))} /></div></div>
+          <div><label className="lbl">End</label><div className="timefield"><input className="inp mono" type="number" value={eH} onChange={(e) => setEH(num(e.target.value))} />:<input className="inp mono" type="number" value={eM} onChange={(e) => setEM(num(e.target.value))} /></div></div>
+        </div>
+        <div className="grid3" style={{ marginTop: 12 }}>
+          <div><label className="lbl">Slot min</label><input className="inp mono" type="number" value={c.presenterMinutes} onChange={(e) => setC({ ...c, presenterMinutes: num(e.target.value) })} /></div>
+          <div><label className="lbl">Break (default)</label><input className="inp mono" type="number" value={c.breakMinutes} onChange={(e) => setC({ ...c, breakMinutes: num(e.target.value) })} /></div>
+          <div><label className="lbl">Buffer min</label><input className="inp mono" type="number" value={c.bufferMinutes} onChange={(e) => setC({ ...c, bufferMinutes: num(e.target.value) })} /></div>
+        </div>
+        <div className="muted sm" style={{ marginTop: 10 }}>
+          With 3 presenters: {fmtTime(sH * 60 + sM)} + 3×{c.presenterMinutes} + 2×{c.breakMinutes} + {c.bufferMinutes} buffer
+          {" → "}ends {fmtTime(sH * 60 + sM + 3 * c.presenterMinutes + 2 * c.breakMinutes + c.bufferMinutes)} (limit {fmtTime(eH * 60 + eM)}).
+        </div>
+      </div>
+      <button className="btn full" onClick={save}>{saved ? "Saved ✓" : "Save settings"}</button>
+    </>
+  );
+}
+
+/* ================================================================== */
+/*  Setup + Identity                                                  */
+/* ================================================================== */
+function Setup({ onDone, persistOk }) {
+  const [name, setName] = useState("Wellbeing Lab"); const [email, setEmail] = useState(""); const [pin, setPin] = useState("1234");
+  const [ga, setGa] = useState(""); const [gb, setGb] = useState("");
+  const go = () => {
+    const roster = [];
+    ga.split("\n").map((s) => s.trim()).filter(Boolean).forEach((n) => roster.push({ id: uid(), name: n, group: "A" }));
+    gb.split("\n").map((s) => s.trim()).filter(Boolean).forEach((n) => roster.push({ id: uid(), name: n, group: "B" }));
+    onDone({ ...DEFAULT_CONFIG, labName: name || "Our Lab", teacherEmail: email, adminPin: pin || "1234" }, roster);
+  };
+  return (
+    <div style={{ padding: 22 }}>
+      <div className="kicker">FIRST-TIME SETUP</div>
+      <h1 style={{ marginTop: 4 }}>Set up your lab</h1>
+      <p className="muted">Do this once. Everyone who opens this app then shares the same schedule & attendance.</p>
+      {!persistOk && <div className="warn-strip" style={{ marginBottom: 14 }}><AlertTriangle size={13} /> Can't reach the database yet — paste your Supabase URL & key near the top of index.html, then redeploy.</div>}
+      <div className="card form">
+        <label className="lbl">Lab name</label>
+        <input className="inp" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Neuro Systems Lab" />
+        <label className="lbl" style={{ marginTop: 12 }}>Teacher's email</label>
+        <input className="inp" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="optional" />
+        <label className="lbl" style={{ marginTop: 12 }}>Admin PIN</label>
+        <input className="inp" value={pin} onChange={(e) => setPin(e.target.value)} />
+        <div className="grid2" style={{ marginTop: 14 }}>
+          <div><label className="lbl">Group A members</label><textarea className="ta" rows={5} value={ga} onChange={(e) => setGa(e.target.value)} placeholder="one name per line" /></div>
+          <div><label className="lbl">Group B members</label><textarea className="ta" rows={5} value={gb} onChange={(e) => setGb(e.target.value)} placeholder="one name per line" /></div>
+        </div>
+        <button className="btn full" style={{ marginTop: 16 }} onClick={go}>Create lab</button>
+      </div>
+      <Style />
+    </div>
+  );
+}
+
+function Identity({ roster, onPick }) {
+  return (
+    <div style={{ padding: 22 }}>
+      <div className="kicker">WHO ARE YOU?</div>
+      <h1 style={{ marginTop: 4 }}>Pick your name</h1>
+      <p className="muted">So your attendance is logged as you on this device.</p>
+      {["A", "B"].map((g) => (
+        <div key={g}>
+          <SectionTitle n={"G" + g}>Group {g}</SectionTitle>
+          <div className="picker">
+            {roster.filter((r) => r.group === g).map((r) => (
+              <button key={r.id} className="pick" onClick={() => onPick(r.id)}>{r.name}</button>
+            ))}
+            {roster.filter((r) => r.group === g).length === 0 && <span className="muted sm">none</span>}
+          </div>
+        </div>
+      ))}
+      <Style />
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  Bits                                                              */
+/* ================================================================== */
+const SectionTitle = ({ n, children }) => (
+  <div className="sect"><span className="sect-n">{n}</span><span className="sect-line" /><span className="sect-t">{children}</span></div>
+);
+const Empty = ({ icon: Icon, title, sub }) => (
+  <div className="card empty"><Icon size={26} /><h3>{title}</h3>{sub && <p className="muted">{sub}</p>}</div>
+);
+function Modal({ title, children, onClose }) {
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-hd"><h3>{title}</h3><button className="ghost" onClick={onClose}><X size={18} /></button></div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  Style                                                             */
+/* ================================================================== */
+function Style() {
+  return (
+    <style>{`
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+:root{
+  --paper:#FAF7EE; --card:#FFFDF6; --ink:#1C1B16; --ink-soft:#6B6857;
+  --line:#1C1B16; --teal:#0E5C4A; --teal-2:#127a62; --rust:#A5421B; --amber:#B8791C;
+  --mono:'JetBrains Mono',monospace; --disp:'Fraunces',serif; --body:'Newsreader',serif;
+}
+*{box-sizing:border-box}
+.wrap{min-height:100vh;background:var(--paper);
+  background-image:linear-gradient(rgba(14,92,74,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(14,92,74,.045) 1px,transparent 1px);
+  background-size:22px 22px;display:flex;justify-content:center;padding:16px;font-family:var(--body);color:var(--ink)}
+.paper{width:100%;max-width:460px}
+h1{font-family:var(--disp);font-weight:600;font-size:25px;margin:0;letter-spacing:-.01em}
+h3{font-family:var(--disp);font-weight:600;margin:0 0 4px}
+.kicker{font-family:var(--mono);font-size:10px;letter-spacing:.22em;color:var(--teal);font-weight:600}
+.muted{color:var(--ink-soft)} .sm{font-size:13px}
+.mono{font-family:var(--mono)}
+
+.hd{padding:6px 18px 10px;display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px}
+.hd-right{display:flex;align-items:center;gap:8px}
+.who{display:flex;align-items:center;gap:7px;background:var(--card);border:1.5px solid var(--line);padding:6px 10px;border-radius:2px;cursor:pointer;font-family:var(--body)}
+.who-name{font-weight:500;font-size:13px}
+.badge{font-family:var(--mono);font-size:10px;background:var(--ink);color:var(--paper);padding:2px 6px;border-radius:2px}
+.warn-strip{flex-basis:100%;font-family:var(--mono);font-size:11px;color:var(--rust);display:flex;gap:6px;align-items:center;border:1px dashed var(--rust);padding:6px 8px;border-radius:2px}
+
+.tabs{display:flex;gap:0;border-bottom:1.5px solid var(--line);margin:4px 18px 18px}
+.tab{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;background:none;border:none;padding:11px 4px;font-family:var(--mono);font-size:12px;font-weight:500;color:var(--ink-soft);cursor:pointer;border-bottom:2.5px solid transparent;margin-bottom:-1.5px}
+.tab.on{color:var(--ink);border-bottom-color:var(--teal)}
+
+.card{background:var(--card);border:1.5px solid var(--line);border-radius:3px;padding:16px;margin-bottom:14px}
+.card.lead{box-shadow:5px 5px 0 var(--ink)}
+.lead-top{display:flex;justify-content:space-between;align-items:center}
+.gtag{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.1em;padding:3px 8px;border-radius:2px;border:1.5px solid var(--line)}
+.gtag.gA{background:var(--teal);color:#fff;border-color:var(--teal)}
+.gtag.gB{background:var(--amber);color:#fff;border-color:var(--amber)}
+.countdown{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--rust);letter-spacing:.08em}
+.bigdate{font-family:var(--disp);font-size:28px;font-weight:600;margin-top:10px;line-height:1.1}
+.timerange{font-family:var(--mono);font-size:13px;color:var(--ink-soft);margin-top:2px}
+.rsvp-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px dashed rgba(28,27,22,.25)}
+.rsvp-label{font-size:13px;color:var(--ink-soft)}
+.pill{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;border:1.5px solid var(--line)}
+.pill.yes{background:#e7f3ee;color:var(--teal)} .pill.no{background:#f7e9e2;color:var(--rust)} .pill.pend{color:var(--ink-soft)}
+
+.sect{display:flex;align-items:center;gap:10px;margin:22px 2px 10px}
+.sect-n{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--teal)}
+.sect-line{flex:1;height:1.5px;background:var(--line);opacity:.25}
+.sect-t{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft)}
+
+.slot{display:flex;align-items:center;gap:12px;padding:10px 0}
+.slot:not(:last-child){border-bottom:1px solid rgba(28,27,22,.1)}
+.slot-ic{color:var(--teal);flex-shrink:0}
+.slot-main{flex:1}.slot-name{font-family:var(--disp);font-size:17px;font-weight:600}
+.slot-time{font-family:var(--mono);font-size:12px;color:var(--ink-soft)}
+.slot-no{font-family:var(--mono);font-size:20px;font-weight:700;color:rgba(28,27,22,.15)}
+.break{text-align:center;font-family:var(--mono);font-size:10.5px;color:var(--amber);padding:4px 0;letter-spacing:.05em}
+.buffer{font-family:var(--mono);font-size:11px;color:var(--ink-soft);margin-top:8px;padding-top:8px;border-top:1px dashed rgba(28,27,22,.2)}
+.warn-inline{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px;color:var(--rust);margin-top:8px}
+.card.soft{display:flex;align-items:center;font-family:var(--mono);font-size:12.5px;color:var(--amber)}
+
+.att-summary{display:flex;gap:18px;padding-bottom:12px;margin-bottom:8px;border-bottom:1px dashed rgba(28,27,22,.2)}
+.att-stat{display:flex;flex-direction:column}.att-stat b{font-family:var(--disp);font-size:24px}.att-stat span{font-family:var(--mono);font-size:10px;color:var(--ink-soft);letter-spacing:.06em}
+.att-list{display:flex;flex-direction:column}
+.att-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:15px;border-bottom:1px solid rgba(28,27,22,.07)}
+.att-row:last-child{border-bottom:none}
+.dot{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1.5px solid var(--line)}
+.dot.yes{background:var(--teal);color:#fff;border-color:var(--teal)}.dot.no{background:var(--rust);color:#fff;border-color:var(--rust)}.dot.pend{color:var(--ink-soft);font-weight:700}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--teal);color:#fff;border:1.5px solid var(--line);border-radius:2px;padding:9px 16px;font-family:var(--mono);font-size:13px;font-weight:600;cursor:pointer}
+.btn:active{transform:translate(1px,1px)}
+.btn.sm{padding:5px 11px;font-size:11px}
+.btn.full{width:100%}
+.btn.outline{background:var(--card);color:var(--ink)}
+.ghost{background:none;border:1.5px solid transparent;border-radius:2px;padding:6px;cursor:pointer;color:var(--ink-soft);display:inline-flex;align-items:center;justify-content:center}
+.ghost:hover{border-color:var(--line);color:var(--ink)}
+.ghost.danger:hover{color:var(--rust);border-color:var(--rust)}
+.ghost.sm{font-family:var(--mono);font-size:11px;padding:4px 7px}
+
+.inp,.ta{width:100%;background:var(--paper);border:1.5px solid var(--line);border-radius:2px;padding:9px 10px;font-family:var(--body);font-size:15px;color:var(--ink)}
+.inp.mono{font-family:var(--mono);text-align:center}
+.ta{font-family:var(--body);resize:vertical;line-height:1.5}
+.inp:focus,.ta:focus{outline:none;box-shadow:2px 2px 0 var(--teal)}
+.lbl{display:block;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-soft);margin-bottom:5px;letter-spacing:.04em}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.timefield{display:flex;align-items:center;gap:4px;font-family:var(--mono)}
+.form .row-end{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+
+.seg{display:flex;border:1.5px solid var(--line);border-radius:2px;overflow:hidden}
+.seg.sm .seg-b{padding:7px}
+.seg-b{flex:1;background:var(--card);border:none;padding:11px;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink-soft);cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;border-right:1.5px solid var(--line)}
+.seg-b:last-child{border-right:none}
+.seg-b.on{background:var(--ink);color:var(--paper)}
+.seg-b.on.yes{background:var(--teal)} .seg-b.on.no{background:var(--rust)}
+
+.picker{display:flex;flex-wrap:wrap;gap:7px}
+.pick{background:var(--card);border:1.5px solid var(--line);border-radius:2px;padding:8px 12px;font-family:var(--body);font-size:14px;cursor:pointer;display:flex;align-items:center;gap:6px}
+.pick.on{background:var(--teal);color:#fff;border-color:var(--teal)}
+.pick-no{font-family:var(--mono);font-size:10px;background:#fff;color:var(--teal);width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700}
+.guest-tag{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;background:var(--amber);color:#fff;padding:1px 5px;border-radius:2px;margin-left:6px;vertical-align:middle}
+.grp-dot{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;font-family:var(--mono);font-size:9px;font-weight:700;color:#fff;margin-right:8px;vertical-align:middle}
+.grp-dot.gA{background:var(--teal)} .grp-dot.gB{background:var(--amber)}
+.present-mark{color:var(--teal);margin-left:6px;vertical-align:middle}
+.notify{display:flex;align-items:center;justify-content:space-between;gap:12px;border-color:var(--teal);box-shadow:4px 4px 0 var(--teal)}
+.notify-t{font-family:var(--disp);font-size:16px;font-weight:600}
+.email-chip{display:inline-flex;align-items:center;gap:4px;margin-left:8px;background:none;border:1px solid rgba(28,27,22,.25);border-radius:2px;padding:2px 7px;font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);cursor:pointer;vertical-align:middle}
+.email-chip:hover{border-color:var(--teal);color:var(--teal)}
+.rec-mail{font-family:var(--mono);font-size:11px;color:var(--ink-soft);margin-left:8px}
+.opt-dot{display:inline-flex;align-items:center;justify-content:center;height:16px;border-radius:8px;padding:0 6px;font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#fff;background:var(--ink-soft);margin-right:8px;vertical-align:middle}
+.email-chip.missing{border-color:var(--rust);color:var(--rust)}
+.name-edit{background:none;border:none;border-bottom:1px dashed transparent;font-family:var(--body);font-size:15px;color:var(--ink);cursor:pointer;padding:2px 0}
+.name-edit:hover{border-bottom-color:var(--ink-soft)}
+.inform{display:flex;align-items:flex-start;gap:8px;background:#f7e9e2;border:1.5px solid var(--rust);border-radius:3px;padding:10px 12px;font-size:13.5px;line-height:1.4;color:var(--rust)}
+.inform svg{flex-shrink:0;margin-top:2px}
+
+.preview{margin-top:14px;border:1px dashed rgba(28,27,22,.3);border-radius:2px;padding:10px}
+.pv-row{display:flex;justify-content:space-between;font-size:14px;padding:3px 0}
+.pv-row.finish{border-top:1px dashed rgba(28,27,22,.2);margin-top:4px;padding-top:6px;color:var(--ink-soft)}
+.pv-break{display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:11px;color:var(--amber);padding:2px 0 2px 12px}
+.pv-break-edit{display:flex;align-items:center;gap:5px}
+.inp.brk{width:52px;padding:3px 4px;font-size:12px}
+
+.subtabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.subtab{background:var(--card);border:1.5px solid var(--line);border-radius:2px;padding:6px 12px;font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--ink-soft);cursor:pointer}
+.subtab.on{background:var(--ink);color:var(--paper)}
+
+.line-row{display:flex;justify-content:space-between;align-items:center;padding:12px 14px}
+.lr-date{font-family:var(--disp);font-size:16px;font-weight:600;display:flex;align-items:center;gap:7px}
+.lr-actions{display:flex;gap:4px;align-items:center}
+
+.hist{padding:0;overflow:hidden}
+.hist-head{width:100%;background:none;border:none;display:flex;justify-content:space-between;align-items:center;padding:14px 16px;cursor:pointer;text-align:left;color:var(--ink)}
+.hist-date{font-family:var(--disp);font-size:16px;font-weight:600;display:flex;align-items:center}
+.hist-sub{font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);margin-top:2px}
+.hist-body{padding:0 16px 16px;border-top:1px dashed rgba(28,27,22,.2)}
+.mini-lbl{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin:12px 0 6px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-family:var(--mono);font-size:11.5px;background:var(--paper);border:1px solid var(--line);border-radius:2px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
+.chip.teal{background:#e7f3ee;color:var(--teal);border-color:var(--teal)}
+.chip.out{background:#f7e9e2;color:var(--rust);border-color:var(--rust)}
+
+.reason{display:flex;flex-direction:column;gap:1px;padding:8px 0;border-bottom:1px solid rgba(28,27,22,.08)}
+.reason b{font-family:var(--disp);font-size:15px}.reason span{font-size:14px;color:var(--ink-soft)}
+
+.empty{text-align:center;padding:40px 20px;color:var(--ink-soft)}.empty h3{margin-top:10px}
+.lock{text-align:center;padding:34px 22px}.lock h3{margin-top:10px}.lock .inp{margin:14px 0 12px;text-align:center;letter-spacing:.3em}
+
+.overlay{position:fixed;inset:0;background:rgba(28,27,22,.45);display:flex;align-items:flex-end;justify-content:center;z-index:50;padding:0}
+.modal{background:var(--card);border:1.5px solid var(--line);border-radius:6px 6px 0 0;padding:18px;width:100%;max-width:460px;box-shadow:0 -6px 0 var(--ink)}
+.modal-hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+@media(min-width:520px){.overlay{align-items:center}.modal{border-radius:6px;box-shadow:6px 6px 0 var(--ink)}}
+    `}</style>
+  );
+}
+
+
+const root = createRoot(document.getElementById("root"));
+root.render(<LabMeetingApp />);
+
+</script>
+</body>
+</html>
