@@ -1,6 +1,6 @@
 # Wellbeing Lab Meetings
 
-A lightweight web app for organising a research lab's recurring meetings — tracking who is **attending** and who is **presenting**, so meetings stop falling apart when people quietly don't show up or arrive unprepared.
+A lightweight web app for organising a research lab's recurring meetings: tracking who is **attending** and who is **presenting**, so meetings stop falling apart when people quietly don't show up or arrive unprepared.
 
 It runs as a single static page backed by a small database, so the whole lab opens one link and shares the same live schedule and attendance — no installs, no accounts.
 
